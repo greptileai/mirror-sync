@@ -3,18 +3,21 @@
 Sync script for mirroring facebook/react PRs to greptileai/react-mirror.
 
 This script:
-1. Creates mirror PRs for new upstream PRs
+1. Creates mirror PRs for new upstream PRs (with labels, draft status)
 2. Updates mirror branches when upstream PRs are updated
-3. Merges mirror PRs when upstream PRs are merged
-4. Closes mirror PRs when upstream PRs are closed (not merged)
+3. Syncs PR metadata (title, body, labels, draft status) when upstream changes
+4. Closes mirror PRs when upstream PRs are closed/merged
+
+Note: PRs are for visibility only. Code sync happens via branch force-push.
+When upstream PRs close/merge, mirror PRs are simply closed (not merged)
+since the code is already in the mirror via branch sync.
 """
 
 import json
-import re
 import subprocess
 import sys
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 UPSTREAM_REPO = "facebook/react"
 FORK_REPO = "greptileai/react-mirror"
@@ -52,7 +55,7 @@ def get_upstream_prs() -> List[Dict]:
         "--repo", UPSTREAM_REPO,
         "--state", "open",
         "--limit", "500",
-        "--json", "number,title,baseRefName,headRefName,headRefOid,body,author"
+        "--json", "number,title,baseRefName,headRefName,headRefOid,body,author,labels,isDraft"
     ])
     return json.loads(result) if result else []
 
@@ -65,27 +68,10 @@ def get_fork_prs() -> Dict[str, Dict]:
         "--repo", FORK_REPO,
         "--state", "open",
         "--limit", "1000",
-        "--json", "number,title,headRefName,headRefOid,body"
+        "--json", "number,title,headRefName,headRefOid,body,labels,isDraft,id"
     ])
     prs = json.loads(result) if result else []
     return {pr["headRefName"]: pr for pr in prs}
-
-
-def extract_upstream_pr_num(pr: Dict) -> Optional[int]:
-    """Extract the upstream PR number from the mirror PR body."""
-    body = pr.get("body", "")
-    match = re.search(r"facebook/react#(\d+)", body)
-    return int(match.group(1)) if match else None
-
-
-def get_upstream_pr_state(pr_num: int) -> Optional[Dict]:
-    """Get the state of an upstream PR (open, closed, merged)."""
-    result = run_gh([
-        "pr", "view", str(pr_num),
-        "--repo", UPSTREAM_REPO,
-        "--json", "state,merged"
-    ], check=False)
-    return json.loads(result) if result else None
 
 
 def get_branch_name(pr: Dict, all_prs: List[Dict]) -> str:
@@ -123,6 +109,100 @@ def ensure_base_branch_exists(base_ref: str) -> bool:
         return False
 
 
+def get_label_names(pr: Dict) -> List[str]:
+    """Extract label names from PR labels."""
+    labels = pr.get("labels", [])
+    return [label["name"] for label in labels]
+
+# Do not tag author with @
+def build_pr_body(pr_num: int, author: str, body: str) -> str:
+    """Build the mirror PR body with upstream reference."""
+    return f"""**Mirror of [{UPSTREAM_REPO}#{pr_num}](https://github.com/{UPSTREAM_REPO}/pull/{pr_num})**
+**Original author:** {author} 
+
+---
+
+{body}"""
+
+
+def mark_pr_ready(fork_pr_num: int) -> bool:
+    """Mark a draft PR as ready for review."""
+    try:
+        run_gh([
+            "pr", "ready", str(fork_pr_num),
+            "--repo", FORK_REPO
+        ])
+        return True
+    except:
+        return False
+
+
+def convert_pr_to_draft(pr_node_id: str) -> bool:
+    """Convert a ready PR back to draft using GraphQL."""
+    try:
+        run_gh([
+            "api", "graphql",
+            "-f", f"query=mutation {{ convertPullRequestToDraft(input: {{pullRequestId: \"{pr_node_id}\"}}) {{ pullRequest {{ isDraft }} }} }}"
+        ])
+        return True
+    except:
+        return False
+
+
+def sync_labels(fork_pr_num: int, upstream_labels: List[str], fork_labels: List[str]) -> None:
+    """Sync labels between upstream and fork PRs."""
+    upstream_set = set(upstream_labels)
+    fork_set = set(fork_labels)
+
+    # Labels to add
+    to_add = upstream_set - fork_set
+    if to_add:
+        run_gh([
+            "pr", "edit", str(fork_pr_num),
+            "--repo", FORK_REPO,
+            "--add-label", ",".join(to_add)
+        ], check=False)  # Don't fail if labels don't exist on fork
+
+    # Labels to remove
+    to_remove = fork_set - upstream_set
+    if to_remove:
+        run_gh([
+            "pr", "edit", str(fork_pr_num),
+            "--repo", FORK_REPO,
+            "--remove-label", ",".join(to_remove)
+        ], check=False)
+
+
+def update_pr_metadata(fork_pr_num: int, title: str, body: str, upstream_labels: List[str], fork_labels: List[str], is_draft: bool, fork_is_draft: bool, pr_node_id: str) -> bool:
+    """Update PR title, body, labels, and draft status."""
+    try:
+        # Update title and body
+        run_gh([
+            "pr", "edit", str(fork_pr_num),
+            "--repo", FORK_REPO,
+            "--title", title,
+            "--body", body
+        ])
+
+        # Sync labels (add new, remove old)
+        sync_labels(fork_pr_num, upstream_labels, fork_labels)
+
+        # Update draft status if changed
+        if is_draft and not fork_is_draft:
+            # Convert to draft
+            print(f"    Converting PR #{fork_pr_num} to draft")
+            convert_pr_to_draft(pr_node_id)
+        elif not is_draft and fork_is_draft:
+            # Mark as ready
+            print(f"    Marking PR #{fork_pr_num} as ready")
+            mark_pr_ready(fork_pr_num)
+
+        return True
+    except Exception as e:
+        print(f"  Failed to update PR metadata: {e}")
+        return False
+
+
 def create_or_update_pr(pr: Dict, branch_name: str, fork_prs: Dict[str, Dict]) -> str:
     """
     Create a new PR or update existing one.
@@ -134,25 +214,51 @@ def create_or_update_pr(pr: Dict, branch_name: str, fork_prs: Dict[str, Dict]) -
     body = pr.get("body") or ""
     author = pr["author"]["login"]
     upstream_sha = pr["headRefOid"]
+    upstream_labels = get_label_names(pr)
+    is_draft = pr.get("isDraft", False)
+
+    # Build the expected mirror PR body
+    expected_body = build_pr_body(pr_num, author, body)
 
     # Check if PR already exists on fork
     existing = fork_prs.get(branch_name)
 
     if existing:
-        # Check if update needed by comparing SHAs
+        fork_pr_num = existing["number"]
         fork_sha = existing.get("headRefOid", "")
-        if fork_sha == upstream_sha:
-            return "unchanged"
+        fork_title = existing.get("title", "")
+        fork_body = existing.get("body", "")
+        fork_labels = get_label_names(existing)
+        fork_is_draft = existing.get("isDraft", False)
+        fork_node_id = existing.get("id", "")
 
-        # Update the branch
-        print(f"  [{pr_num}] Updating: {branch_name}")
-        try:
-            run_cmd(["git", "fetch", "upstream", f"pull/{pr_num}/head:{branch_name}", "--force"])
-            run_cmd(["git", "push", "origin", branch_name, "--force"])
+        # Check if branch update needed
+        branch_updated = False
+        if fork_sha != upstream_sha:
+            print(f"  [{pr_num}] Updating branch: {branch_name}")
+            try:
+                run_cmd(["git", "fetch", "upstream", f"pull/{pr_num}/head:{branch_name}", "--force"])
+                run_cmd(["git", "push", "origin", branch_name, "--force"])
+                branch_updated = True
+            except Exception as e:
+                print(f"  [{pr_num}] Failed to update branch: {e}")
+                return "failed"
+
+        # Check if metadata update needed (title, body, labels, or draft status differ)
+        metadata_changed = (
+            fork_title != title or
+            fork_body != expected_body or
+            set(fork_labels) != set(upstream_labels) or
+            fork_is_draft != is_draft
+        )
+
+        if metadata_changed:
+            print(f"  [{pr_num}] Updating metadata: {branch_name}")
+            update_pr_metadata(fork_pr_num, title, expected_body, upstream_labels, fork_labels, is_draft, fork_is_draft, fork_node_id)
+
+        if branch_updated or metadata_changed:
             return "updated"
-        except Exception as e:
-            print(f"  [{pr_num}] Failed to update branch: {e}")
-            return "failed"
+        return "unchanged"
 
     # New PR - ensure base branch exists
     if not ensure_base_branch_exists(base):
@@ -160,7 +266,8 @@ def create_or_update_pr(pr: Dict, branch_name: str, fork_prs: Dict[str, Dict]) -
         return "failed"
 
     # Create new branch
-    print(f"  [{pr_num}] Creating: {title[:50]}...")
+    draft_label = " [DRAFT]" if is_draft else ""
+    print(f"  [{pr_num}] Creating{draft_label}: {title[:50]}...")
     try:
         run_cmd(["git", "fetch", "upstream", f"pull/{pr_num}/head:{branch_name}"])
         run_cmd(["git", "push", "origin", branch_name])
@@ -168,23 +275,26 @@ def create_or_update_pr(pr: Dict, branch_name: str, fork_prs: Dict[str, Dict]) -
         print(f"  [{pr_num}] Failed to create branch: {e}")
         return "failed"
 
-    # Create PR
-    pr_body = f"""**Mirror of [{UPSTREAM_REPO}#{pr_num}](https://github.com/{UPSTREAM_REPO}/pull/{pr_num})**
-**Original author:** {author}
-
----
-
-{body}"""
-
+    # Create PR with labels and draft status
     try:
-        result = run_gh([
+        create_args = [
             "pr", "create",
             "--repo", FORK_REPO,
             "--head", branch_name,
             "--base", base,
             "--title", title,
-            "--body", pr_body
-        ])
+            "--body", expected_body
+        ]
+
+        # Add labels if present
+        if upstream_labels:
+            create_args.extend(["--label", ",".join(upstream_labels)])
+
+        # Create as draft if upstream is draft
+        if is_draft:
+            create_args.append("--draft")
+
+        result = run_gh(create_args)
         print(f"  [{pr_num}] Created: {result}")
         return "created"
     except Exception as e:
@@ -192,45 +302,36 @@ def create_or_update_pr(pr: Dict, branch_name: str, fork_prs: Dict[str, Dict]) -
         return "failed"
 
 
-def close_or_merge_stale_prs(upstream_branches: Set[str], fork_prs: Dict[str, Dict]) -> Tuple[int, int]:
-    """Close or merge PRs on fork based on upstream PR state."""
-    print("\n=== Processing stale PRs ===")
+def close_stale_prs(upstream_branches: Set[str], fork_prs: Dict[str, Dict]) -> int:
+    """
+    Close PRs on fork that no longer exist on upstream.
+
+    Note: We just close PRs instead of merging them because:
+    - The code is already in the mirror via branch sync (force push)
+    - Attempting to merge would fail or create duplicates
+    - PRs are for visibility only, not for code integration
+    """
+    print("\n=== Closing stale PRs ===")
     closed = 0
-    merged = 0
 
     for branch_name, pr in fork_prs.items():
         if branch_name not in upstream_branches:
             pr_num = pr["number"]
-            upstream_pr_num = extract_upstream_pr_num(pr)
-
-            if upstream_pr_num:
-                # Check if upstream PR was merged
-                upstream_state = get_upstream_pr_state(upstream_pr_num)
-                if upstream_state and upstream_state.get("merged"):
-                    print(f"  Merging PR #{pr_num} (upstream #{upstream_pr_num} was merged)")
-                    try:
-                        run_gh([
-                            "pr", "merge", str(pr_num),
-                            "--repo", FORK_REPO,
-                            "--merge",
-                            "--delete-branch"
-                        ], check=False)
-                        merged += 1
-                        continue
-                    except:
-                        print(f"  Failed to merge PR #{pr_num}, will close instead")
-
-            # Close if not merged or merge failed
             print(f"  Closing PR #{pr_num}: {branch_name}")
             try:
-                run_gh(["pr", "close", str(pr_num), "--repo", FORK_REPO, "--delete-branch"], check=False)
+                run_gh([
+                    "pr", "close", str(pr_num),
+                    "--repo", FORK_REPO,
+                    "--delete-branch",
+                    "--comment", "Upstream PR was closed or merged. Code is synced via branch mirror."
+                ], check=False)
                 closed += 1
             except:
                 print(f"  Failed to close PR #{pr_num}")
 
             time.sleep(0.3)  # Rate limiting
 
-    return closed, merged
+    return closed
 
 
 def sync_prs():
@@ -275,14 +376,13 @@ def sync_prs():
         # Small delay to avoid rate limiting
         time.sleep(0.3)
 
-    # Close or merge stale PRs
-    closed, merged = close_or_merge_stale_prs(upstream_branches, fork_prs)
+    # Close stale PRs (code is already synced via branches)
+    closed = close_stale_prs(upstream_branches, fork_prs)
 
     print(f"\n=== PR Sync Summary ===")
     print(f"Created: {created}")
     print(f"Updated: {updated}")
     print(f"Unchanged: {unchanged}")
-    print(f"Merged: {merged}")
     print(f"Closed: {closed}")
     print(f"Failed: {failed}")
 
