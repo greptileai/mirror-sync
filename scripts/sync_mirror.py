@@ -269,8 +269,8 @@ def create_or_update_pr(pr: Dict, branch_name: str, fork_prs: Dict[str, Dict]) -
     draft_label = " [DRAFT]" if is_draft else ""
     print(f"  [{pr_num}] Creating{draft_label}: {title[:50]}...")
     try:
-        run_cmd(["git", "fetch", "upstream", f"pull/{pr_num}/head:{branch_name}"])
-        run_cmd(["git", "push", "origin", branch_name])
+        run_cmd(["git", "fetch", "upstream", f"pull/{pr_num}/head:{branch_name}", "--force"])
+        run_cmd(["git", "push", "origin", branch_name, "--force"])
     except Exception as e:
         print(f"  [{pr_num}] Failed to create branch: {e}")
         return "failed"
