@@ -23,6 +23,9 @@ from typing import Dict, List, Optional, Set
 UPSTREAM_REPO = "facebook/react"
 FORK_REPO = "greptileai/react-mirror"
 
+# PRs to skip (e.g., branch name collisions with repo branches)
+EXCLUDED_PRS = {32222}
+
 
 def run_cmd(cmd: List[str], capture: bool = True, check: bool = True) -> Optional[str]:
     """Run a command and return stdout."""
@@ -369,6 +372,13 @@ def sync_prs():
 
     # Process each upstream PR
     for pr in upstream_prs_sorted:
+        pr_num = pr["number"]
+
+        # Skip excluded PRs (e.g., branch name collisions)
+        if pr_num in EXCLUDED_PRS:
+            print(f"  [{pr_num}] Skipping (excluded)")
+            continue
+
         branch_name = get_branch_name(pr, upstream_prs)
         upstream_branches.add(branch_name)
 
