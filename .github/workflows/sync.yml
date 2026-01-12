@@ -96,6 +96,8 @@ jobs:
       - name: Sync all branches
         working-directory: mirror
         run: |
+          set +e  # Don't exit on error
+
           # Sync all branches from upstream
           git fetch upstream '+refs/heads/*:refs/remotes/upstream/*' --prune
 
@@ -109,10 +111,10 @@ jobs:
             echo "Syncing branch: $branch"
             git checkout -B "$branch" "upstream/$branch"
             if git push origin "$branch" --force 2>&1; then
-              ((synced++))
+              synced=$((synced + 1))
             else
               echo "⚠️  Skipped: $branch (likely contains secrets)"
-              ((skipped++))
+              skipped=$((skipped + 1))
               skipped_branches="$skipped_branches $branch"
             fi
           done
@@ -129,6 +131,8 @@ jobs:
 
           # Return to main (or master if main doesn't exist)
           git checkout main 2>/dev/null || git checkout master
+
+          exit 0  # Always succeed
 
       - name: Sync default branch
         env:
