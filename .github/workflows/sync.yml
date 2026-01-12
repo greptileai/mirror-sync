@@ -24,11 +24,11 @@ jobs:
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
 
-          # Convert repos array to JSON
-          repos=$(yq -o=json '.repos' repos.yaml)
+          # Convert repos array to compact single-line JSON (required for GitHub Actions)
+          repos=$(yq -o=json -I=0 '.repos' repos.yaml)
           echo "repos=$repos" >> $GITHUB_OUTPUT
           echo "Found repos:"
-          echo "$repos" | jq -r '.[].name'
+          yq -r '.repos[].name' repos.yaml
 
   sync:
     needs: load-repos
