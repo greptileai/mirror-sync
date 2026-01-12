@@ -5,7 +5,12 @@ on:
     # Run every 30 minutes
     - cron: '*/30 * * * *'
   workflow_dispatch:
-    # Allow manual trigger
+    inputs:
+      repos:
+        description: 'Repos to sync (comma-separated names, or "all")'
+        required: false
+        default: 'all'
+        type: string
 
 jobs:
   load-repos:
@@ -18,20 +23,36 @@ jobs:
 
       - name: Parse repos.yaml
         id: parse
+        env:
+          INPUT_REPOS: ${{ github.event.inputs.repos || 'all' }}
         run: |
           # Convert YAML to JSON for matrix
           # Install yq for YAML parsing
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
 
-          # Convert repos array to compact single-line JSON (required for GitHub Actions)
-          repos=$(yq -o=json -I=0 '.repos' repos.yaml)
+          # Get all repos from yaml
+          all_repos=$(yq -o=json -I=0 '.repos' repos.yaml)
+
+          # Filter repos if specific ones requested
+          if [ "$INPUT_REPOS" = "all" ] || [ -z "$INPUT_REPOS" ]; then
+            repos="$all_repos"
+            echo "Syncing all repos:"
+          else
+            # Filter to only requested repos
+            repos=$(echo "$all_repos" | jq -c --arg names "$INPUT_REPOS" '
+              ($names | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $filter |
+              map(select(.name as $n | $filter | index($n)))
+            ')
+            echo "Syncing selected repos:"
+          fi
+
           echo "repos=$repos" >> $GITHUB_OUTPUT
-          echo "Found repos:"
-          yq -r '.repos[].name' repos.yaml
+          echo "$repos" | jq -r '.[].name'
 
   sync:
     needs: load-repos
+    if: ${{ needs.load-repos.outputs.repos != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
