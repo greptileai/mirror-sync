@@ -99,15 +99,51 @@ jobs:
           # Sync all branches from upstream
           git fetch upstream '+refs/heads/*:refs/remotes/upstream/*' --prune
 
+          # Track results
+          synced=0
+          skipped=0
+          skipped_branches=""
+
           # Push each upstream branch to origin
           for branch in $(git branch -r | grep 'upstream/' | grep -v HEAD | sed 's|upstream/||'); do
             echo "Syncing branch: $branch"
             git checkout -B "$branch" "upstream/$branch"
-            git push origin "$branch" --force
+            if git push origin "$branch" --force 2>&1; then
+              ((synced++))
+            else
+              echo "⚠️  Skipped: $branch (likely contains secrets)"
+              ((skipped++))
+              skipped_branches="$skipped_branches $branch"
+            fi
           done
+
+          echo ""
+          echo "================================"
+          echo "Branch sync complete"
+          echo "  Synced: $synced"
+          echo "  Skipped: $skipped"
+          if [ -n "$skipped_branches" ]; then
+            echo "  Skipped branches:$skipped_branches"
+          fi
+          echo "================================"
 
           # Return to main (or master if main doesn't exist)
           git checkout main 2>/dev/null || git checkout master
+
+      - name: Sync default branch
+        env:
+          GH_TOKEN: ${{ secrets.MIRROR_PAT }}
+        run: |
+          UPSTREAM_REPO="${{ matrix.repo.upstream }}"
+          MIRROR_REPO="${{ matrix.repo.mirror }}"
+
+          # Get upstream default branch
+          DEFAULT_BRANCH=$(gh repo view "$UPSTREAM_REPO" --json defaultBranchRef -q '.defaultBranchRef.name')
+          echo "Upstream default branch: $DEFAULT_BRANCH"
+
+          # Set mirror default branch to match
+          gh repo edit "$MIRROR_REPO" --default-branch "$DEFAULT_BRANCH" || true
+          echo "Mirror default branch set to: $DEFAULT_BRANCH"
 
       - name: Sync tags
         working-directory: mirror
