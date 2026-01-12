@@ -254,7 +254,9 @@ def create_or_update_pr(config: RepoConfig, pr: Dict, branch_name: str, fork_prs
         if fork_sha != upstream_sha:
             print(f"  [{pr_num}] Updating branch: {branch_name}")
             try:
-                run_cmd(["git", "fetch", "upstream", f"pull/{pr_num}/head:{branch_name}", "--force"])
+                # Fetch to FETCH_HEAD first to avoid conflict with checked-out branches
+                run_cmd(["git", "fetch", "upstream", f"pull/{pr_num}/head"])
+                run_cmd(["git", "branch", "-f", branch_name, "FETCH_HEAD"])
                 run_cmd(["git", "push", "origin", branch_name, "--force"])
                 branch_updated = True
             except Exception as e:
@@ -286,7 +288,9 @@ def create_or_update_pr(config: RepoConfig, pr: Dict, branch_name: str, fork_prs
     draft_label = " [DRAFT]" if is_draft else ""
     print(f"  [{pr_num}] Creating{draft_label}: {title[:50]}...")
     try:
-        run_cmd(["git", "fetch", "upstream", f"pull/{pr_num}/head:{branch_name}", "--force"])
+        # Fetch to FETCH_HEAD first to avoid conflict with checked-out branches
+        run_cmd(["git", "fetch", "upstream", f"pull/{pr_num}/head"])
+        run_cmd(["git", "branch", "-f", branch_name, "FETCH_HEAD"])
         run_cmd(["git", "push", "origin", branch_name, "--force"])
     except Exception as e:
         print(f"  [{pr_num}] Failed to create branch: {e}")
